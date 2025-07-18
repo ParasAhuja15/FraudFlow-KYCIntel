@@ -1,0 +1,78 @@
+import pandas as pd
+from mlxtend.frequent_patterns import fpgrowth, association_rules
+import numpy as np
+from datetime import timedelta
+from collections import Counter
+
+# Load data
+# df = pd.read_csv("transactions.csv")
+df['Datetime'] = pd.to_datetime(df['Date'] + ' ' + df['Time'])
+# df['Datetime'] = pd.to_datetime(df['Datetime'])  # if already in single column
+
+# Simplify for FP mining
+# Define a transaction signature (e.g., based on sender, receiver, payment type)
+def create_transaction_signature(row):
+    return f"{row['Sender_account']}->{row['Receiver_account']}|{row['Payment_type']}"
+
+df['txn_signature'] = df.apply(create_transaction_signature, axis=1)
+
+# Group data into time windows (e.g., weekly)
+df.set_index('Datetime', inplace=True)
+start_date = df.index.min()
+end_date = df.index.max()
+window_size = '7D'
+
+fp_patterns = []
+all_rules = []
+
+# Simulate streaming with weekly windows
+current_start = start_date
+while current_start <= end_date:
+    current_end = current_start + pd.Timedelta(window_size)
+    window_df = df.loc[current_start:current_end]
+
+    # Create transactional dataframe for FP-Growth
+    txn_sets = window_df.groupby('Is_laundering')['txn_signature'].apply(list).reset_index()
+
+    # Convert to one-hot encoded dataframe (transaction x items)
+    basket = []
+    for txn_list in txn_sets['txn_signature']:
+        basket.append({item: 1 for item in txn_list})
+    basket_df = pd.DataFrame(basket).fillna(0).astype(bool)
+
+    # FP-Growth mining
+    if len(basket_df) > 0:
+        freq_items = fpgrowth(basket_df, min_support=0.1, use_colnames=True)
+        rules = association_rules(freq_items, metric="confidence", min_threshold=0.6)
+        rules['window_start'] = current_start
+        all_rules.append(rules)
+
+    current_start = current_end + timedelta(days=1)
+
+# Combine rules across windows
+rules_df = pd.concat(all_rules, ignore_index=True)
+rules_df.to_csv("frequent_rules.csv", index=False)
+
+print(f"✅ Extracted {len(rules_df)} rules from time-windowed FP-Growth.")
+
+# === Stage 2: Rule-based classification function ===
+
+def classify_transaction(txn_sig, rules_df):
+    matched = rules_df[rules_df['antecedents'].apply(lambda x: txn_sig in str(x))]
+
+    if matched.empty:
+        return "unknown"
+
+    # Assume label is based on 'Is_laundering' implied by matching transactions
+    labels = matched['consequents'].astype(str).tolist()
+    label_counts = Counter(labels)
+    most_common_label, count = label_counts.most_common(1)[0]
+    
+    return most_common_label
+
+# Apply to new data for classification
+test_txns = df.sample(20)
+test_txns['predicted_label'] = test_txns['txn_signature'].apply(lambda x: classify_transaction(x, rules_df))
+
+print("✅ Rule-based classification complete on test sample.")
+print(test_txns[['txn_signature', 'predicted_label', 'Is_laundering']])

@@ -1,0 +1,168 @@
+import pandas as pd
+import numpy as np
+from sklearn.svm import SVC
+from sklearn.model_selection import train_test_split, GridSearchCV
+from sklearn.preprocessing import StandardScaler
+from sklearn.metrics import (classification_report, confusion_matrix, 
+                            roc_auc_score, average_precision_score)
+from sklearn.pipeline import Pipeline
+import matplotlib.pyplot as plt
+import seaborn as sns
+import json
+from joblib import dump, load
+
+# Load your pre-processed data
+def load_profiles_and_features():
+    """Load the profile and feature data you've already created"""
+    with open('sender_profiles.json') as f:
+        sender_profiles = pd.json_normalize(json.load(f))
+    
+    with open('receiver_profiles.json') as f:
+        receiver_profiles = pd.json_normalize(json.load(f))
+    
+    sender_features = pd.read_csv('sender_features.csv')
+    receiver_features = pd.read_csv('receiver_features.csv')
+    
+    # Merge profiles and features
+    sender_data = sender_profiles.merge(sender_features, on='account_id')
+    receiver_data = receiver_profiles.merge(receiver_features, on='account_id')
+    
+    return sender_data, receiver_data
+
+# Enhanced feature engineering combining your work
+def create_training_data(sender_data, receiver_data):
+    """Combine sender and receiver features with transaction labels"""
+    # Load original transactions to get labels
+    transactions = pd.read_csv('aml_transactions.csv')
+    
+    # Aggregate laundering flags by account
+    sender_labels = transactions.groupby('Sender_account')['Is_laundering'].max()
+    receiver_labels = transactions.groupby('Receiver_account')['Is_laundering'].max()
+    
+    # Merge with features
+    sender_data = sender_data.set_index('account_id').join(sender_labels, how='left')
+    receiver_data = receiver_data.set_index('account_id').join(receiver_labels, how='left')
+    
+    # Combine sender and receiver data
+    combined_data = pd.concat([sender_data, receiver_data])
+    combined_data['Is_laundering'] = combined_data['Is_laundering'].fillna(0).astype(int)
+    
+    return combined_data
+
+# SVM Model Training with your features
+def train_svm_model(data):
+    """Train SVM using your engineered features"""
+    # Select features - using all the ones you created
+    feature_cols = [
+        'total_txns', 'total_amount', 'mean_txn_amount', 'std_dev_amount',
+        'avg_daily_amount', 'std_daily_amount', 'max_daily_amount', 'daily_txn_count',
+        'avg_weekly_amount', 'std_weekly_amount', 'max_weekly_amount', 'weekly_txn_count',
+        'avg_monthly_amount', 'std_monthly_amount', 'max_monthly_amount', 'monthly_txn_count'
+    ]
+    
+    # Add encoded categorical features from your profiles
+    categorical_cols = ['most_common_payment_type', 'most_common_currency']
+    for col in categorical_cols:
+        if col in data.columns:
+            data = pd.get_dummies(data, columns=[col], prefix=[col])
+            feature_cols.extend([c for c in data.columns if c.startswith(col)])
+    
+    X = data[feature_cols]
+    y = data['Is_laundering']
+    
+    # Split data
+    X_train, X_test, y_train, y_test = train_test_split(
+        X, y, test_size=0.3, random_state=42, stratify=y)
+    
+    # Create pipeline with scaling and SVM
+    pipeline = Pipeline([
+        ('scaler', StandardScaler()),
+        ('svm', SVC(kernel='rbf', class_weight='balanced', probability=True, random_state=42))
+    ])
+    
+    # Hyperparameter tuning
+    param_grid = {
+        'svm__C': [0.1, 1, 10, 100],
+        'svm__gamma': ['scale', 'auto', 0.01, 0.1, 1]
+    }
+    
+    grid_search = GridSearchCV(pipeline, param_grid, cv=5, scoring='roc_auc', n_jobs=-1)
+    grid_search.fit(X_train, y_train)
+    
+    print(f"Best parameters: {grid_search.best_params_}")
+    print(f"Best CV AUC: {grid_search.best_score_:.4f}")
+    
+    return grid_search.best_estimator_, X_test, y_test, feature_cols
+
+# Model evaluation
+def evaluate_model(model, X_test, y_test):
+    """Comprehensive model evaluation"""
+    y_pred = model.predict(X_test)
+    y_proba = model.predict_proba(X_test)[:, 1]
+    
+    print("Classification Report:")
+    print(classification_report(y_test, y_pred))
+    
+    print("\nConfusion Matrix:")
+    print(confusion_matrix(y_test, y_pred))
+    
+    print(f"\nROC AUC: {roc_auc_score(y_test, y_proba):.4f}")
+    print(f"Average Precision: {average_precision_score(y_test, y_proba):.4f}")
+    
+    # Plot confusion matrix
+    plt.figure(figsize=(8, 6))
+    sns.heatmap(confusion_matrix(y_test, y_pred), 
+                annot=True, fmt='d', cmap='Blues',
+                xticklabels=['Legitimate', 'Laundering'],
+                yticklabels=['Legitimate', 'Laundering'])
+    plt.title('Confusion Matrix')
+    plt.ylabel('True Label')
+    plt.xlabel('Predicted Label')
+    plt.show()
+    
+    # Plot ROC curve
+    from sklearn.metrics import RocCurveDisplay
+    RocCurveDisplay.from_estimator(model, X_test, y_test)
+    plt.title('ROC Curve')
+    plt.show()
+
+# Feature importance analysis
+def plot_feature_importance(model, feature_names):
+    """Plot feature importance for SVM (using coefficients for linear kernel)"""
+    if hasattr(model.named_steps['svm'], 'coef_'):
+        importance = model.named_steps['svm'].coef_[0]
+        feature_importance = pd.DataFrame({
+            'Feature': feature_names,
+            'Importance': importance
+        }).sort_values('Importance', key=abs, ascending=False)
+        
+        plt.figure(figsize=(12, 8))
+        sns.barplot(x='Importance', y='Feature', data=feature_importance.head(20))
+        plt.title('Top 20 Important Features (SVM Coefficients)')
+        plt.show()
+    else:
+        print("Feature importance not available for non-linear SVM")
+
+# Main execution
+def main():
+    # Load your pre-processed data
+    sender_data, receiver_data = load_profiles_and_features()
+    
+    # Create training data
+    training_data = create_training_data(sender_data, receiver_data)
+    
+    # Train SVM model
+    model, X_test, y_test, feature_cols = train_svm_model(training_data)
+    
+    # Evaluate model
+    evaluate_model(model, X_test, y_test)
+    
+    # Save model
+    dump(model, 'aml_svm_model.joblib')
+    print("Model saved to 'aml_svm_model.joblib'")
+    
+    # Feature importance (if using linear kernel)
+    plot_feature_importance(model, feature_cols)
+
+if __name__ == "__main__":
+    main()

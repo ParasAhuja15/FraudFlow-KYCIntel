@@ -1,0 +1,350 @@
+import pandas as pd
+import numpy as np
+from sklearn.cluster import KMeans
+from sklearn.metrics import pairwise_distances
+from scipy.stats import pearsonr
+import matplotlib.pyplot as plt
+import seaborn as sns
+from datetime import datetime, timedelta
+from tqdm import tqdm
+transactions = df
+class AMLAnomalyDetector:
+    def __init__(self, time_window='1D', n_clusters=5, correlation_threshold=0.8):
+        """
+        Initialize the anomaly detector with configuration parameters.
+        
+        Args:
+            time_window: Time window for discretization (e.g., '1D' for daily, '1H' for hourly)
+            n_clusters: Number of clusters for k-means segmentation
+            correlation_threshold: Threshold for identifying correlated suspicious behavior
+        """
+        self.time_window = time_window
+        self.n_clusters = n_clusters
+        self.correlation_threshold = correlation_threshold
+        self.customer_profiles = {}
+        self.cluster_models = {}
+        
+    def preprocess_transactions(self, transactions):
+        """
+        Preprocess transaction data and convert to time-series format.
+        
+        Args:
+            transactions: DataFrame with columns:
+                - Timestamp (datetime)
+                - Sender_account
+                - Receiver_account
+                - Amount
+                - (other transaction metadata)
+        """
+        # Convert to datetime if not already
+        transactions['Timestamp'] = pd.to_datetime(transactions['Timestamp'])
+        
+        # Create a combined view of sent and received transactions
+        sent_tx = transactions.groupby(['Sender_account', pd.Grouper(key='Timestamp', freq=self.time_window)]) \
+                            .agg({'Amount': ['count', 'sum']})
+        sent_tx.columns = ['sent_count', 'sent_amount']
+        
+        received_tx = transactions.groupby(['Receiver_account', pd.Grouper(key='Timestamp', freq=self.time_window)]) \
+                                .agg({'Amount': ['count', 'sum']})
+        received_tx.columns = ['received_count', 'received_amount']
+        
+        # Combine sent and received transactions
+        tx_series = pd.concat([sent_tx, received_tx], axis=1).fillna(0)
+        tx_series['net_flow'] = tx_series['received_amount'] - tx_series['sent_amount']
+        
+        return tx_series.reset_index()
+    
+    def create_customer_profiles(self, tx_series):
+        """
+        Create behavioral profiles for each customer based on their transaction patterns.
+        """
+        customers = pd.unique(tx_series['Sender_account'].append(tx_series['Receiver_account']))
+        
+        for customer in tqdm(customers, desc="Creating customer profiles"):
+            # Get all transactions involving this customer
+            cust_tx = tx_series[(tx_series['Sender_account'] == customer) | 
+                              (tx_series['Receiver_account'] == customer)]
+            
+            if len(cust_tx) == 0:
+                continue
+                
+            # Create time-series features
+            profile = {
+                'transaction_counts': cust_tx.set_index('Timestamp')['sent_count'].to_dict(),
+                'transaction_amounts': cust_tx.set_index('Timestamp')['sent_amount'].to_dict(),
+                'received_counts': cust_tx.set_index('Timestamp')['received_count'].to_dict(),
+                'received_amounts': cust_tx.set_index('Timestamp')['received_amount'].to_dict(),
+                'net_flows': cust_tx.set_index('Timestamp')['net_flow'].to_dict()
+            }
+            
+            self.customer_profiles[customer] = profile
+    
+    def discretize_timeline(self, start_date, end_date):
+        """
+        Create a discretized timeline based on the configured time window.
+        """
+        date_range = pd.date_range(start=start_date, end=end_date, freq=self.time_window)
+        return date_range
+    
+    def create_histogram_features(self, customer, timeline):
+        """
+        Create histogram features for a customer across the timeline.
+        """
+        profile = self.customer_profiles.get(customer, {})
+        
+        # Initialize histogram bins
+        count_hist = np.zeros(len(timeline))
+        amount_hist = np.zeros(len(timeline))
+        
+        # Fill histogram bins
+        for i, time_bin in enumerate(timeline):
+            if time_bin in profile.get('transaction_counts', {}):
+                count_hist[i] = profile['transaction_counts'][time_bin]
+                amount_hist[i] = profile['transaction_amounts'][time_bin]
+        
+        return count_hist, amount_hist
+    
+    def cluster_histograms(self, customers, timeline):
+        """
+        Perform k-means clustering on transaction histograms.
+        """
+        # Prepare feature matrix
+        features = []
+        for customer in customers:
+            count_hist, amount_hist = self.create_histogram_features(customer, timeline)
+            features.append(np.concatenate([count_hist, amount_hist]))
+        
+        features = np.array(features)
+        
+        # Cluster using k-means
+        kmeans = KMeans(n_clusters=self.n_clusters, random_state=42)
+        clusters = kmeans.fit_predict(features)
+        
+        return clusters, kmeans
+    
+    def detect_histogram_anomalies(self, customers, clusters, timeline):
+        """
+        Detect anomalies based on histogram clusters and peaks.
+        """
+        anomalies = []
+        
+        for i, customer in enumerate(customers):
+            count_hist, amount_hist = self.create_histogram_features(customer, timeline)
+            cluster = clusters[i]
+            
+            # Calculate deviation from cluster centroid
+            hist_features = np.concatenate([count_hist, amount_hist])
+            centroid = self.cluster_models['kmeans'].cluster_centers_[cluster]
+            distance = np.linalg.norm(hist_features - centroid)
+            
+            # Identify peaks in histogram
+            peak_threshold = np.percentile(amount_hist, 95)
+            peaks = np.where(amount_hist > peak_threshold)[0]
+            
+            if len(peaks) > 0 or distance > np.percentile(self.distances, 95):
+                anomalies.append({
+                    'customer': customer,
+                    'cluster': cluster,
+                    'distance': distance,
+                    'peak_times': [timeline[p] for p in peaks],
+                    'peak_amounts': [amount_hist[p] for p in peaks]
+                })
+        
+        return pd.DataFrame(anomalies)
+    
+    def calculate_correlations(self, anomalies, timeline):
+        """
+        Calculate correlations between anomalous customers.
+        """
+        correlated_groups = []
+        processed = set()
+        
+        # Create correlation matrix
+        anomaly_customers = anomalies['customer'].unique()
+        n = len(anomaly_customers)
+        corr_matrix = np.zeros((n, n))
+        
+        for i in range(n):
+            hist_i, _ = self.create_histogram_features(anomaly_customers[i], timeline)
+            for j in range(i+1, n):
+                hist_j, _ = self.create_histogram_features(anomaly_customers[j], timeline)
+                corr, _ = pearsonr(hist_i, hist_j)
+                corr_matrix[i, j] = corr
+                corr_matrix[j, i] = corr
+        
+        # Find groups with high correlation
+        for i in range(n):
+            if anomaly_customers[i] in processed:
+                continue
+                
+            group = [anomaly_customers[i]]
+            for j in range(n):
+                if i != j and corr_matrix[i, j] > self.correlation_threshold:
+                    group.append(anomaly_customers[j])
+            
+            if len(group) > 1:
+                correlated_groups.append({
+                    'customers': group,
+                    'avg_correlation': np.mean(corr_matrix[i, [idx for idx in range(n) if anomaly_customers[idx] in group]])
+                })
+                processed.update(group)
+        
+        return correlated_groups
+    
+    def visualize_histograms(self, customers, timeline, highlight_peaks=True):
+        """
+        Visualize transaction histograms for specified customers.
+        """
+        plt.figure(figsize=(15, 5 * len(customers)))
+        
+        for i, customer in enumerate(customers, 1):
+            count_hist, amount_hist = self.create_histogram_features(customer, timeline)
+            
+            plt.subplot(len(customers), 1, i)
+            plt.bar(timeline, amount_hist, width=0.8, alpha=0.7)
+            
+            if highlight_peaks:
+                peak_threshold = np.percentile(amount_hist, 95)
+                peaks = np.where(amount_hist > peak_threshold)[0]
+                for p in peaks:
+                    plt.bar(timeline[p], amount_hist[p], color='red', alpha=0.7)
+            
+            plt.title(f"Transaction Amount Histogram for {customer}")
+            plt.xlabel("Time")
+            plt.ylabel("Amount")
+            plt.grid(True)
+        
+        plt.tight_layout()
+        plt.show()
+    
+    def run_analysis(self, transactions, start_date=None, end_date=None):
+        """
+        Run complete anomaly detection pipeline.
+        """
+        # Preprocess transactions
+        print("Preprocessing transactions...")
+        tx_series = self.preprocess_transactions(transactions)
+        
+        # Determine analysis period
+        if start_date is None:
+            start_date = tx_series['Timestamp'].min()
+        if end_date is None:
+            end_date = tx_series['Timestamp'].max()
+        
+        # Create customer profiles
+        print("Creating customer profiles...")
+        self.create_customer_profiles(tx_series)
+        
+        # Discretize timeline
+        timeline = self.discretize_timeline(start_date, end_date)
+        
+        # Cluster transaction patterns
+        print("Clustering transaction patterns...")
+        customers = list(self.customer_profiles.keys())
+        clusters, kmeans = self.cluster_histograms(customers, timeline)
+        self.cluster_models['kmeans'] = kmeans
+        
+        # Calculate distances to centroids
+        features = []
+        for customer in customers:
+            count_hist, amount_hist = self.create_histogram_features(customer, timeline)
+            features.append(np.concatenate([count_hist, amount_hist]))
+        
+        self.distances = pairwise_distances(features, kmeans.cluster_centers_, metric='euclidean').min(axis=1)
+        
+        # Detect anomalies
+        print("Detecting anomalies...")
+        anomalies = self.detect_histogram_anomalies(customers, clusters, timeline)
+        
+        # Find correlated anomalies
+        print("Analyzing correlations...")
+        correlated_groups = self.calculate_correlations(anomalies, timeline)
+        
+        # Prepare results
+        results = {
+            'individual_anomalies': anomalies,
+            'correlated_groups': correlated_groups,
+            'timeline': timeline,
+            'customers': customers,
+            'clusters': clusters
+        }
+        
+        print("Analysis complete.")
+        return results
+
+# Example usage
+if __name__ == "__main__":
+    # Generate synthetic transaction data
+    np.random.seed(42)
+    n_customers = 50
+    n_transactions = 5000
+    
+    customers = [f"CUST_{i:04d}" for i in range(n_customers)]
+    start_date = datetime(2023, 1, 1)
+    end_date = datetime(2023, 6, 30)
+    
+    # Create normal transactions
+    transactions = []
+    for _ in range(n_transactions - 100):  # 100 will be anomalous
+        days = np.random.randint(0, (end_date - start_date).days)
+        timestamp = start_date + timedelta(days=days)
+        
+        sender, receiver = np.random.choice(customers, 2, replace=False)
+        amount = np.random.lognormal(mean=5, sigma=0.5)
+        
+        transactions.append({
+            'Timestamp': timestamp,
+            'Sender_account': sender,
+            'Receiver_account': receiver,
+            'Amount': amount
+        })
+    
+    # Create anomalous transactions (bursts of activity)
+    anomalous_customers = np.random.choice(customers, 5, replace=False)
+    for cust in anomalous_customers:
+        # Create a burst of transactions on specific days
+        for day in np.random.choice(range(0, 180), 3, replace=False):
+            timestamp = start_date + timedelta(days=day)
+            for _ in range(np.random.randint(5, 15)):
+                amount = np.random.lognormal(mean=8, sigma=0.8)  # Larger amounts
+                transactions.append({
+                    'Timestamp': timestamp,
+                    'Sender_account': cust,
+                    'Receiver_account': np.random.choice([c for c in customers if c != cust]),
+                    'Amount': amount
+                })
+    
+    # Create correlated anomalies (potential money laundering rings)
+    laundering_ring = np.random.choice(customers, 3, replace=False)
+    ring_days = np.random.choice(range(30, 150), 5, replace=False)
+    for day in ring_days:
+        timestamp = start_date + timedelta(days=day)
+        for i in range(len(laundering_ring)):
+            sender = laundering_ring[i]
+            receiver = laundering_ring[(i+1) % len(laundering_ring)]
+            amount = np.random.lognormal(mean=7, sigma=0.3)
+            transactions.append({
+                'Timestamp': timestamp,
+                'Sender_account': sender,
+                'Receiver_account': receiver,
+                'Amount': amount
+            })
+    
+    # Convert to DataFrame
+    transaction_data = pd.DataFrame(transactions)
+    
+    # Initialize and run anomaly detector
+    detector = AMLAnomalyDetector(time_window='1D', n_clusters=5, correlation_threshold=0.7)
+    results = detector.run_analysis(transaction_data, start_date, end_date)
+    
+    # Display results
+    print("\nIndividual Anomalies Detected:")
+    print(results['individual_anomalies'].sort_values('distance', ascending=False).head())
+    
+    print("\nCorrelated Groups Detected:")
+    for group in results['correlated_groups']:
+        print(f"Customers: {group['customers']} | Avg Correlation: {group['avg_correlation']:.2f}")
+    
+    # Visualize some anomalous customers
+    anomalous_customers_to_plot = results['individual_anomalies'].sort_values('distance', ascending=False)['customer'].head(3).tolist()
+    detector.visualize_histograms(anomalous_customers_to_plot, results['timeline'])

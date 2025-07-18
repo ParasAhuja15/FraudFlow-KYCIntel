@@ -1,0 +1,65 @@
+import pandas as pd
+# Convert Date and Time into a single datetime column
+# df['Datetime'] = pd.to_datetime(df['Date'] + ' ' + df['Time'])
+# df.set_index('Datetime', inplace=True)
+
+# # Drop original Time and Date for cleaner structure
+# df.drop(columns=['Time', 'Date'], inplace=True)
+
+def extract_features(df, role='Receiver_account'):
+    group = df.groupby(role)
+    feature_list = []
+
+    for account, acc_df in group:
+        acc_df = acc_df.sort_index()
+
+        # DAILY stats
+        daily = acc_df['Amount'].resample('D').agg(['sum', 'count', 'max'])
+        avg_daily = daily['sum'].mean()
+        std_daily = daily['sum'].std()
+        max_daily = daily['sum'].max()
+        daily_freq = daily['count'].mean()
+
+        # WEEKLY stats
+        weekly = acc_df['Amount'].resample('W').agg(['sum', 'count', 'max'])
+        avg_weekly = weekly['sum'].mean()
+        std_weekly = weekly['sum'].std()
+        max_weekly = weekly['sum'].max()
+        weekly_freq = weekly['count'].mean()
+
+        # MONTHLY stats
+        monthly = acc_df['Amount'].resample('M').agg(['sum', 'count', 'max'])
+        avg_monthly = monthly['sum'].mean()
+        std_monthly = monthly['sum'].std()
+        max_monthly = monthly['sum'].max()
+        monthly_freq = monthly['count'].mean()
+
+        feature_list.append({
+            'account_id': account,
+            'avg_daily_amount': avg_daily,
+            'std_daily_amount': std_daily,
+            'max_daily_amount': max_daily,
+            'daily_txn_count': daily_freq,
+
+            'avg_weekly_amount': avg_weekly,
+            'std_weekly_amount': std_weekly,
+            'max_weekly_amount': max_weekly,
+            'weekly_txn_count': weekly_freq,
+
+            'avg_monthly_amount': avg_monthly,
+            'std_monthly_amount': std_monthly,
+            'max_monthly_amount': max_monthly,
+            'monthly_txn_count': monthly_freq
+        })
+
+    return pd.DataFrame(feature_list)
+
+# Generate for sender and receiver
+sender_features = extract_features(df, role='Sender_account')
+receiver_features = extract_features(df, role='Receiver_account')
+
+# Save for model use
+sender_features.to_csv("sender_features.csv", index=False)
+receiver_features.to_csv("receiver_features.csv", index=False)
+
+print("✅ New features extracted and saved.")

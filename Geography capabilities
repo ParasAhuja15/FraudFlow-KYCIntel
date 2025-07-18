@@ -1,0 +1,107 @@
+import pandas as pd
+import numpy as np
+import matplotlib.pyplot as plt
+import networkx as nx
+from geopy.distance import geodesic
+
+# Load your data (replace with your actual data loading method)
+# df = pd.read_csv('your_data.csv')
+
+# Using sample data that matches your structure
+data = {
+    'Time': ['10:15', '14:30', '03:45', '18:20', '23:10'],
+    'Date': ['2023-01-01', '2023-01-01', '2023-01-02', '2023-01-02', '2023-01-03'],
+    'Sender_account': ['ACC001', 'ACC002', 'ACC003', 'ACC004', 'ACC005'],
+    'Receiver_account': ['ACC101', 'ACC102', 'ACC103', 'ACC104', 'ACC105'],
+    'Amount': [5000, 15000, 75000, 1200, 45000],
+    'Payment_currency': ['USD', 'EUR', 'GBP', 'USD', 'JPY'],
+    'Received_currency': ['USD', 'GBP', 'EUR', 'CAD', 'USD'],
+    'Sender_bank_location': ['USA', 'Germany', 'UK', 'USA', 'Japan'],
+    'Receiver_bank_location': ['USA', 'UK', 'France', 'Canada', 'USA'],
+    'Payment_type': ['Wire', 'Transfer', 'Wire', 'Transfer', 'Wire'],
+    'Is_laundering': [0, 1, 1, 0, 1],
+    'Laundering_type': ['', 'Hawala', 'Trade-based', '', 'Shell company']
+}
+
+df = pd.DataFrame(data)
+
+# Original logic begins (unchanged)
+# 1. Basic Geographic Features
+df['is_cross_border'] = (df['Sender_bank_location'] != df['Receiver_bank_location']).astype(int)
+df['is_currency_exchange'] = (df['Payment_currency'] != df['Received_currency']).astype(int)
+
+# 2. High-risk jurisdiction flags
+high_risk_countries = ['Russia', 'Myanmar', 'North Korea', 'Iran']
+df['sender_high_risk'] = df['Sender_bank_location'].isin(high_risk_countries).astype(int)
+df['receiver_high_risk'] = df['Receiver_bank_location'].isin(high_risk_countries).astype(int)
+
+# 3. Currency exchange analysis
+df['unusual_currency_pair'] = np.where(
+    (~df['Payment_currency'].isin(['USD', 'EUR', 'GBP'])) & 
+    (~df['Received_currency'].isin(['USD', 'EUR', 'GBP'])), 1, 0)
+
+# 4. Transaction time analysis
+df['datetime'] = pd.to_datetime(df['Date'] + ' ' + df['Time'])
+df['hour'] = df['datetime'].dt.hour
+df['after_hours'] = ((df['hour'] < 9) | (df['hour'] > 17)).astype(int)
+
+# 5. Geographic distance calculation
+country_coords = {
+    'USA': (39.8283, -98.5795),
+    'Germany': (51.1657, 10.4515),
+    'UK': (55.3781, -3.4360),
+    'France': (46.2276, 2.2137),
+    'Canada': (56.1304, -106.3468),
+    'Japan': (36.2048, 138.2529)
+}
+
+def calculate_distance(row):
+    try:
+        sender_coord = country_coords.get(row['Sender_bank_location'], (0, 0))
+        receiver_coord = country_coords.get(row['Receiver_bank_location'], (0, 0))
+        return geodesic(sender_coord, receiver_coord).km
+    except:
+        return 0
+
+df['distance_km'] = df.apply(calculate_distance, axis=1)
+
+# 6. Composite risk score
+df['geo_risk_score'] = (
+    df['is_cross_border'] * 0.3 +
+    df['sender_high_risk'] * 0.5 +
+    df['receiver_high_risk'] * 0.5 +
+    df['is_currency_exchange'] * 0.2 +
+    df['unusual_currency_pair'] * 0.4 +
+    df['after_hours'] * 0.2
+)
+
+# Original visualizations (unchanged)
+# Visualization 1: Cross-border transactions
+cross_border_counts = df['is_cross_border'].value_counts()
+cross_border_counts.plot(kind='bar', title='Cross-Border Transactions')
+plt.xticks([0, 1], ['Domestic', 'Cross-border'], rotation=0)
+plt.show()
+
+# Visualization 2: Transaction network
+G = nx.DiGraph()
+for _, row in df.iterrows():
+    G.add_edge(row['Sender_bank_location'], row['Receiver_bank_location'], weight=row['Amount'])
+
+plt.figure(figsize=(10, 8))
+pos = nx.spring_layout(G)
+nx.draw(G, pos, with_labels=True, node_size=2000, node_color='skyblue', 
+        arrowsize=20, width=[d['weight']/5000 for _, _, d in G.edges(data=True)])
+plt.title('Transaction Flow Between Countries')
+plt.show()
+
+# Visualization 3: Risk score distribution
+plt.hist(df['geo_risk_score'], bins=10)
+plt.title('Geographic Risk Score Distribution')
+plt.xlabel('Risk Score')
+plt.ylabel('Number of Transactions')
+plt.show()
+
+# Display the enhanced dataframe
+print("\nEnhanced DataFrame with Geographic Features:")
+print(df[['Sender_bank_location', 'Receiver_bank_location', 'is_cross_border', 
+          'sender_high_risk', 'receiver_high_risk', 'geo_risk_score']].head())

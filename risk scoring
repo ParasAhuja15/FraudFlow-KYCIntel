@@ -1,0 +1,333 @@
+import pandas as pd
+import numpy as np
+from sklearn.tree import DecisionTreeClassifier, export_text, export_graphviz
+from sklearn.model_selection import train_test_split
+from sklearn.metrics import classification_report, confusion_matrix
+from sklearn.preprocessing import LabelEncoder
+import matplotlib.pyplot as plt
+import graphviz
+from IPython.display import display
+
+class MoneyLaunderingRiskScorer:
+    def __init__(self):
+        self.customer_risk_model = None
+        self.transaction_risk_model = None
+        self.customer_encoder_dict = {}
+        self.transaction_encoder_dict = {}
+        self.industry_risk_mapping = {
+            'manufacturing': 'low',
+            'chemical': 'high',
+            'domestic_trading': 'medium',
+            'medicine': 'high',
+            'IT': 'low',
+            'foreign_trading': 'high',
+            'retail': 'low',
+            'advertisement': 'medium',
+            'automobile_sales': 'medium'
+        }
+        self.business_size_risk = {
+            'small': 'low',
+            'medium': 'medium',
+            'large': 'high'
+        }
+        self.location_risk = {
+            'low_risk_country': 'low',
+            'medium_risk_country': 'medium',
+            'high_risk_country': 'high'
+        }
+        self.product_risk = {
+            'checking': 'low',
+            'savings': 'low',
+            'investment': 'high',
+            'foreign_currency': 'high',
+            'business': 'medium'
+        }
+
+    def create_customer_risk_dataset(self, customer_data):
+        """
+        Create customer risk dataset with engineered features.
+        
+        Args:
+            customer_data: DataFrame with customer attributes including:
+                - customer_id, industry_type, business_location, 
+                - business_size, bank_product, is_high_risk (label)
+        """
+        # Create risk features based on business rules
+        customer_data['industry_risk'] = customer_data['industry_type'].map(self.industry_risk_mapping)
+        customer_data['size_risk'] = customer_data['business_size'].map(self.business_size_risk)
+        customer_data['location_risk'] = customer_data['business_location'].map(self.location_risk)
+        customer_data['product_risk'] = customer_data['bank_product'].map(self.product_risk)
+        
+        # Encode categorical risk levels
+        risk_levels = {'low': 0, 'medium': 1, 'high': 2}
+        for col in ['industry_risk', 'size_risk', 'location_risk', 'product_risk']:
+            customer_data[col] = customer_data[col].map(risk_levels)
+        
+        return customer_data
+
+    def create_transaction_risk_dataset(self, transaction_data, customer_risk_scores):
+        """
+        Create transaction risk dataset with features.
+        
+        Args:
+            transaction_data: DataFrame with transaction details
+            customer_risk_scores: DataFrame with customer_id and risk_score
+        """
+        # Merge sender and receiver risk scores
+        tx_data = transaction_data.merge(
+            customer_risk_scores.rename(columns={
+                'customer_id': 'Sender_account',
+                'risk_score': 'sender_risk'
+            }), on='Sender_account', how='left'
+        ).merge(
+            customer_risk_scores.rename(columns={
+                'customer_id': 'Receiver_account',
+                'risk_score': 'receiver_risk'
+            }), on='Receiver_account', how='left'
+        )
+        
+        # Calculate transaction risk features
+        tx_data['amount_risk'] = pd.cut(tx_data['Amount'], 
+                                       bins=[0, 1000, 10000, float('inf')],
+                                       labels=['low', 'medium', 'high']).astype(str)
+        tx_data['currency_risk'] = np.where(tx_data['Payment_currency'] == 'USD', 'low', 'high')
+        tx_data['location_risk'] = np.where(
+            tx_data['Sender_bank_location'] == tx_data['Receiver_bank_location'],
+            'low', 'high'
+        )
+        
+        # Encode categorical features
+        risk_levels = {'low': 0, 'medium': 1, 'high': 2}
+        tx_data['amount_risk'] = tx_data['amount_risk'].map(risk_levels)
+        tx_data['currency_risk'] = tx_data['currency_risk'].map(risk_levels)
+        tx_data['location_risk'] = tx_data['location_risk'].map(risk_levels)
+        
+        # Fill NA values (for customers not in our risk database)
+        tx_data['sender_risk'] = tx_data['sender_risk'].fillna(1)  # Default medium risk
+        tx_data['receiver_risk'] = tx_data['receiver_risk'].fillna(1)  # Default medium risk
+        
+        return tx_data
+
+    def train_customer_risk_model(self, customer_data):
+        """
+        Train a decision tree model for customer risk scoring.
+        """
+        # Prepare the data
+        customer_data = self.create_customer_risk_dataset(customer_data)
+        
+        # Encode categorical features
+        categorical_cols = ['industry_type', 'business_location', 'business_size', 'bank_product']
+        for col in categorical_cols:
+            le = LabelEncoder()
+            customer_data[col] = le.fit_transform(customer_data[col])
+            self.customer_encoder_dict[col] = le
+        
+        # Features and target
+        X = customer_data[['industry_type', 'business_location', 'business_size', 'bank_product',
+                          'industry_risk', 'size_risk', 'location_risk', 'product_risk']]
+        y = customer_data['is_high_risk']
+        
+        # Train-test split
+        X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.2, random_state=42)
+        
+        # Train decision tree
+        self.customer_risk_model = DecisionTreeClassifier(
+            max_depth=5,
+            min_samples_split=10,
+            min_samples_leaf=5,
+            random_state=42
+        )
+        self.customer_risk_model.fit(X_train, y_train)
+        
+        # Evaluate
+        y_pred = self.customer_risk_model.predict(X_test)
+        print("Customer Risk Model Evaluation:")
+        print(classification_report(y_test, y_pred))
+        print("\nConfusion Matrix:")
+        print(confusion_matrix(y_test, y_pred))
+        
+        # Visualize the tree
+        self.visualize_decision_tree(self.customer_risk_model, X.columns, "customer_risk_tree")
+
+    def train_transaction_risk_model(self, transaction_data, customer_risk_scores):
+        """
+        Train a decision tree model for transaction risk scoring.
+        """
+        # Prepare the data
+        tx_data = self.create_transaction_risk_dataset(transaction_data, customer_risk_scores)
+        
+        # Features and target
+        X = tx_data[['sender_risk', 'receiver_risk', 'amount_risk', 'currency_risk', 'location_risk']]
+        y = tx_data['Is_laundering']
+        
+        # Train-test split
+        X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.2, random_state=42)
+        
+        # Train decision tree
+        self.transaction_risk_model = DecisionTreeClassifier(
+            max_depth=4,
+            min_samples_split=20,
+            min_samples_leaf=10,
+            random_state=42
+        )
+        self.transaction_risk_model.fit(X_train, y_train)
+        
+        # Evaluate
+        y_pred = self.transaction_risk_model.predict(X_test)
+        print("\nTransaction Risk Model Evaluation:")
+        print(classification_report(y_test, y_pred))
+        print("\nConfusion Matrix:")
+        print(confusion_matrix(y_test, y_pred))
+        
+        # Visualize the tree
+        self.visualize_decision_tree(self.transaction_risk_model, X.columns, "transaction_risk_tree")
+
+    def visualize_decision_tree(self, model, feature_names, filename):
+        """Visualize the decision tree."""
+        dot_data = export_graphviz(
+            model,
+            out_file=None,
+            feature_names=feature_names,
+            class_names=['Low/Medium', 'High'],
+            filled=True,
+            rounded=True,
+            special_characters=True
+        )
+        graph = graphviz.Source(dot_data)
+        display(graph)
+        graph.render(filename, format='png', cleanup=True)
+        plt.close()
+
+    def predict_customer_risk(self, customer_data):
+        """Predict risk for new customers."""
+        if self.customer_risk_model is None:
+            raise ValueError("Customer risk model has not been trained yet.")
+        
+        # Prepare the data
+        customer_data = self.create_customer_risk_dataset(customer_data)
+        
+        # Encode categorical features
+        for col, le in self.customer_encoder_dict.items():
+            customer_data[col] = le.transform(customer_data[col])
+        
+        # Features
+        X = customer_data[['industry_type', 'business_location', 'business_size', 'bank_product',
+                          'industry_risk', 'size_risk', 'location_risk', 'product_risk']]
+        
+        # Predict
+        predictions = self.customer_risk_model.predict(X)
+        probabilities = self.customer_risk_model.predict_proba(X)[:, 1]  # Probability of high risk
+        
+        return pd.DataFrame({
+            'customer_id': customer_data['customer_id'],
+            'predicted_risk': predictions,
+            'risk_probability': probabilities
+        })
+
+    def predict_transaction_risk(self, transaction_data, customer_risk_scores):
+        """Predict risk for new transactions."""
+        if self.transaction_risk_model is None:
+            raise ValueError("Transaction risk model has not been trained yet.")
+        
+        # Prepare the data
+        tx_data = self.create_transaction_risk_dataset(transaction_data, customer_risk_scores)
+        
+        # Features
+        X = tx_data[['sender_risk', 'receiver_risk', 'amount_risk', 'currency_risk', 'location_risk']]
+        
+        # Predict
+        predictions = self.transaction_risk_model.predict(X)
+        probabilities = self.transaction_risk_model.predict_proba(X)[:, 1]  # Probability of suspicious
+        
+        return pd.DataFrame({
+            'transaction_id': tx_data.index,
+            'sender_account': tx_data['Sender_account'],
+            'receiver_account': tx_data['Receiver_account'],
+            'amount': tx_data['Amount'],
+            'predicted_risk': predictions,
+            'risk_probability': probabilities
+        })
+
+    def generate_business_rules_report(self):
+        """Generate human-readable business rules from the decision trees."""
+        if self.customer_risk_model is None or self.transaction_risk_model is None:
+            raise ValueError("Models have not been trained yet.")
+        
+        print("="*50)
+        print("CUSTOMER RISK BUSINESS RULES")
+        print("="*50)
+        print(export_text(self.customer_risk_model, 
+                         feature_names=['industry_type', 'business_location', 'business_size', 'bank_product',
+                                      'industry_risk', 'size_risk', 'location_risk', 'product_risk']))
+        
+        print("\n" + "="*50)
+        print("TRANSACTION RISK BUSINESS RULES")
+        print("="*50)
+        print(export_text(self.transaction_risk_model,
+                         feature_names=['sender_risk', 'receiver_risk', 'amount_risk', 'currency_risk', 'location_risk']))
+
+# Example usage with your data structure
+if __name__ == "__main__":
+    # Initialize the risk scorer
+    risk_scorer = MoneyLaunderingRiskScorer()
+
+    # Load or create your customer data (must contain the required columns)
+    customer_data = pd.DataFrame({
+        'customer_id': ['ACC001', 'ACC002', 'ACC003', 'ACC004', 'ACC005'],
+        'industry_type': ['IT', 'foreign_trading', 'retail', 'chemical', 'manufacturing'],
+        'business_location': ['low_risk_country', 'medium_risk_country', 'low_risk_country', 'high_risk_country', 'low_risk_country'],
+        'business_size': ['small', 'medium', 'large', 'medium', 'small'],
+        'bank_product': ['checking', 'foreign_currency', 'savings', 'investment', 'business'],
+        'is_high_risk': [0, 1, 0, 1, 0]  # Your actual labels
+    })
+
+    # Load or create your transaction data (must contain the required columns)
+    transaction_data = pd.DataFrame({
+        'Sender_account': ['ACC001', 'ACC002', 'ACC003', 'ACC004', 'ACC005'],
+        'Receiver_account': ['ACC101', 'ACC102', 'ACC103', 'ACC104', 'ACC105'],
+        'Amount': [5000, 15000, 75000, 1200, 45000],
+        'Payment_currency': ['USD', 'EUR', 'GBP', 'USD', 'JPY'],
+        'Sender_bank_location': ['USA', 'Germany', 'UK', 'USA', 'Japan'],
+        'Receiver_bank_location': ['USA', 'UK', 'France', 'Canada', 'USA'],
+        'Is_laundering': [0, 1, 1, 0, 1]  # Your actual labels
+    })
+
+    # Map your bank locations to risk categories (you'll need to adjust this)
+    country_risk_mapping = {
+        'USA': 'low_risk_country',
+        'Germany': 'low_risk_country',
+        'UK': 'low_risk_country',
+        'France': 'medium_risk_country',
+        'Canada': 'low_risk_country',
+        'Japan': 'medium_risk_country'
+        # Add all countries in your data
+    }
+    
+    # Apply the mapping to your data
+    customer_data['business_location'] = customer_data['business_location'].map(country_risk_mapping)
+    transaction_data['Sender_bank_location'] = transaction_data['Sender_bank_location'].map(country_risk_mapping)
+    transaction_data['Receiver_bank_location'] = transaction_data['Receiver_bank_location'].map(country_risk_mapping)
+
+    # Train customer risk model
+    print("Training customer risk model...")
+    risk_scorer.train_customer_risk_model(customer_data)
+    
+    # Get customer risk scores
+    customer_risk_scores = risk_scorer.predict_customer_risk(customer_data)
+    
+    # Train transaction risk model
+    print("\nTraining transaction risk model...")
+    risk_scorer.train_transaction_risk_model(transaction_data, customer_risk_scores)
+    
+    # Generate business rules report
+    print("\nGenerating business rules...")
+    risk_scorer.generate_business_rules_report()
+    
+    # Predict on new data
+    print("\nPredicting customer risks...")
+    new_customer_risks = risk_scorer.predict_customer_risk(customer_data.head())
+    print(new_customer_risks)
+    
+    print("\nPredicting transaction risks...")
+    new_transaction_risks = risk_scorer.predict_transaction_risk(transaction_data.head(), customer_risk_scores)
+    print(new_transaction_risks)

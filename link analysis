@@ -1,0 +1,218 @@
+import pandas as pd
+import networkx as nx
+from sklearn.preprocessing import MinMaxScaler
+import matplotlib.pyplot as plt
+
+class MoneyLaunderingDetectionSystem:
+    def __init__(self, transaction_data):
+        """
+        Initialize the MLDS system with transaction data.
+        
+        Args:
+            transaction_data (pd.DataFrame): DataFrame containing transaction data with columns:
+                - Time, Date, Sender_account, Receiver_account, Amount, 
+                - Payment_currency, Received_currency, Sender_bank_location, 
+                - Receiver_bank_location, Payment_type, Is_laundering, Laundering_type
+        """
+        self.transactions = transaction_data
+        self.graph = nx.DiGraph()  # Directed graph for money flow
+        self.node_roles = {}
+        
+    def build_transaction_network(self):
+        """Build a directed graph from transaction data."""
+        # Add all edges (transactions) to the graph
+        for _, row in self.transactions.iterrows():
+            sender = row['Sender_account']
+            receiver = row['Receiver_account']
+            amount = row['Amount']
+            
+            if self.graph.has_edge(sender, receiver):
+                # Update edge weight if transaction already exists
+                self.graph[sender][receiver]['weight'] += amount
+                self.graph[sender][receiver]['count'] += 1
+            else:
+                # Add new edge with transaction details
+                self.graph.add_edge(sender, receiver, weight=amount, count=1)
+                
+    def calculate_sna_measures(self):
+        """Calculate all six SNA measures for each node in the network."""
+        measures = {}
+        
+        # 1. Degree (in-degree and out-degree)
+        measures['degree_in'] = dict(self.graph.in_degree(weight='weight'))
+        measures['degree_out'] = dict(self.graph.out_degree(weight='weight'))
+        measures['degree_total'] = dict(self.graph.degree(weight='weight'))
+        
+        # 2. Betweenness centrality
+        measures['betweenness'] = nx.betweenness_centrality(self.graph, weight='weight')
+        
+        # 3. Closeness centrality
+        measures['closeness'] = nx.closeness_centrality(self.graph, distance='weight')
+        
+        # 4. PageRank
+        measures['pagerank'] = nx.pagerank(self.graph, weight='weight')
+        
+        # 5. HITS algorithm (Hub and Authority scores)
+        hubs, authorities = nx.hits(self.graph)
+        measures['hubness'] = hubs
+        measures['authoritativeness'] = authorities
+        
+        return measures
+    
+    def normalize_measures(self, measures):
+        """Normalize all measures to 0-1 scale for comparison."""
+        normalized = {}
+        scaler = MinMaxScaler()
+        
+        for measure_name, values in measures.items():
+            # Convert dict to array and reshape for scaler
+            nodes = list(values.keys())
+            vals = [[v] for v in values.values()]
+            
+            # Normalize
+            normalized_vals = scaler.fit_transform(vals)
+            
+            # Convert back to dict
+            normalized[measure_name] = {node: val[0] for node, val in zip(nodes, normalized_vals)}
+            
+        return normalized
+    
+    def assign_roles(self, normalized_measures):
+        """
+        Assign roles to nodes based on normalized measure values.
+        This is a simplified version - in practice you would use more sophisticated rules.
+        """
+        roles = {}
+        
+        for node in self.graph.nodes():
+            # Get all measures for this node
+            node_measures = {
+                'degree_in': normalized_measures['degree_in'].get(node, 0),
+                'degree_out': normalized_measures['degree_out'].get(node, 0),
+                'betweenness': normalized_measures['betweenness'].get(node, 0),
+                'closeness': normalized_measures['closeness'].get(node, 0),
+                'pagerank': normalized_measures['pagerank'].get(node, 0),
+                'hubness': normalized_measures['hubness'].get(node, 0),
+                'authoritativeness': normalized_measures['authoritativeness'].get(node, 0)
+            }
+            
+            # Simple role assignment logic (can be enhanced)
+            if node_measures['betweenness'] > 0.8 and node_measures['degree_total'] > 0.7:
+                roles[node] = 'Central Hub'
+            elif node_measures['degree_in'] > 0.8 and node_measures['degree_out'] < 0.2:
+                roles[node] = 'Sink'
+            elif node_measures['degree_out'] > 0.8 and node_measures['degree_in'] < 0.2:
+                roles[node] = 'Source'
+            elif node_measures['hubness'] > 0.7 and node_measures['authoritativeness'] < 0.3:
+                roles[node] = 'Connector'
+            else:
+                roles[node] = 'Normal'
+                
+        return roles
+    
+    def detect_suspicious_patterns(self, roles):
+        """
+        Detect suspicious patterns based on account roles and transaction patterns.
+        Returns a DataFrame of suspicious accounts with their scores.
+        """
+        suspicious_accounts = []
+        
+        for account, role in roles.items():
+            # Calculate suspicion score based on role and measures
+            score = 0
+            
+            # Central hubs are more suspicious
+            if role == 'Central Hub':
+                score += 0.5
+                
+            # Accounts with high betweenness but low authority
+            if (self.normalized_measures['betweenness'].get(account, 0) > 0.7 and 
+                self.normalized_measures['authoritativeness'].get(account, 0) < 0.3):
+                score += 0.3
+                
+            # Accounts with high in-degree but low out-degree (potential money sinks)
+            if (self.normalized_measures['degree_in'].get(account, 0) > 0.8 and 
+                self.normalized_measures['degree_out'].get(account, 0) < 0.2):
+                score += 0.4
+                
+            if score > 0:
+                suspicious_accounts.append({
+                    'account': account,
+                    'role': role,
+                    'suspicion_score': min(1.0, score),  # Cap at 1.0
+                    'degree_in': self.normalized_measures['degree_in'].get(account, 0),
+                    'degree_out': self.normalized_measures['degree_out'].get(account, 0),
+                    'betweenness': self.normalized_measures['betweenness'].get(account, 0),
+                    'pagerank': self.normalized_measures['pagerank'].get(account, 0)
+                })
+                
+        return pd.DataFrame(suspicious_accounts).sort_values('suspicion_score', ascending=False)
+    
+    def visualize_network(self, highlight_accounts=None):
+        """Visualize the transaction network with optional highlighting."""
+        plt.figure(figsize=(12, 10))
+        
+        # Position nodes using spring layout
+        pos = nx.spring_layout(self.graph, k=0.15, iterations=20)
+        
+        # Draw all nodes and edges
+        nx.draw_networkx_nodes(self.graph, pos, node_size=50, node_color='lightblue')
+        nx.draw_networkx_edges(self.graph, pos, edge_color='gray', width=0.5, alpha=0.5)
+        
+        # Highlight suspicious accounts if provided
+        if highlight_accounts is not None:
+            nx.draw_networkx_nodes(
+                self.graph, pos, 
+                nodelist=highlight_accounts, 
+                node_size=100, 
+                node_color='red'
+            )
+            
+        plt.title("Transaction Network with Suspicious Accounts Highlighted")
+        plt.axis('off')
+        plt.show()
+    
+    def run_analysis(self):
+        """Run complete MLDS analysis pipeline."""
+        print("Building transaction network...")
+        self.build_transaction_network()
+        
+        print("Calculating SNA measures...")
+        measures = self.calculate_sna_measures()
+        
+        print("Normalizing measures...")
+        self.normalized_measures = self.normalize_measures(measures)
+        
+        print("Assigning roles to accounts...")
+        self.roles = self.assign_roles(self.normalized_measures)
+        
+        print("Detecting suspicious patterns...")
+        suspicious_accounts = self.detect_suspicious_patterns(self.roles)
+        
+        print("Analysis complete.")
+        return suspicious_accounts
+
+# Example usage
+if __name__ == "__main__":
+    # Load your transaction data (replace with your actual data)
+    # transaction_data = pd.read_csv('your_transaction_data.csv')
+    
+    # For demonstration, create some synthetic data
+    data = {
+        'Sender_account': ['A', 'A', 'B', 'C', 'D', 'E', 'F', 'G', 'H', 'I', 'J'],
+        'Receiver_account': ['B', 'C', 'D', 'E', 'F', 'G', 'H', 'I', 'J', 'K', 'L'],
+        'Amount': [1000, 2000, 3000, 4000, 5000, 1000, 2000, 3000, 4000, 5000, 10000],
+        'Is_laundering': [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1]  # 1 indicates money laundering
+    }
+    transaction_data = pd.DataFrame(data)
+    transaction_data = df
+    # Initialize and run MLDS
+    mlds = MoneyLaunderingDetectionSystem(transaction_data)
+    results = mlds.run_analysis()
+    
+    # Display results
+    print("\nTop suspicious accounts:")
+    print(results.head())
+    
+    # Visualize network with suspicious accounts highlighted
+    mlds.visualize_network(highlight_accounts=results['account'].head(3).tolist())

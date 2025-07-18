@@ -1,0 +1,64 @@
+import pandas as pd
+# Check required columns exist (we'll need at least these for the consolidation)
+required_columns = [ 'Amount', 'Sender_account', 'Receiver_account']
+if not all(col in df.columns for col in required_columns):
+    missing = [col for col in required_columns if col not in df.columns]
+    raise ValueError(f"Missing required columns in the dataset: {missing}")
+
+# # Convert Date and Time into a single datetime column
+# df['Datetime'] = pd.to_datetime(df['Date'] + ' ' + df['Time'])
+# df.set_index('Datetime', inplace=True)
+
+# # Drop original Time and Date for cleaner structure
+# df.drop(columns=['Time', 'Date'], inplace=True)
+
+# Function to consolidate transactions for each account over time
+def consolidate_transactions(df, role='Sender_account'):
+    grouped = df.groupby(role)
+
+    daily_list, weekly_list, monthly_list = [], [], []
+
+    for account, group in grouped:
+        group = group.sort_index()
+
+        # Daily aggregation - include count of transactions and sum of amounts
+        daily = group['Amount'].resample('D').agg(['sum', 'count']).reset_index()
+        daily[role] = account
+        daily.rename(columns={'sum': 'daily_total', 'count': 'daily_count'}, inplace=True)
+        daily_list.append(daily)
+
+        # Weekly aggregation
+        weekly = group['Amount'].resample('W-SUN').agg(['sum', 'count']).reset_index()
+        weekly[role] = account
+        weekly.rename(columns={'sum': 'weekly_total', 'count': 'weekly_count'}, inplace=True)
+        weekly_list.append(weekly)
+
+        # Monthly aggregation
+        monthly = group['Amount'].resample('ME').agg(['sum', 'count']).reset_index()
+        monthly[role] = account
+        monthly.rename(columns={'sum': 'monthly_total', 'count': 'monthly_count'}, inplace=True)
+        monthly_list.append(monthly)
+
+    daily_df = pd.concat(daily_list, ignore_index=True)
+    weekly_df = pd.concat(weekly_list, ignore_index=True)
+    monthly_df = pd.concat(monthly_list, ignore_index=True)
+
+    return daily_df, weekly_df, monthly_df
+
+try:
+    # Consolidate for Sender and Receiver accounts
+    sender_daily, sender_weekly, sender_monthly = consolidate_transactions(df, role='Sender_account')
+    receiver_daily, receiver_weekly, receiver_monthly = consolidate_transactions(df, role='Receiver_account')
+
+    # Save to files
+    sender_daily.to_csv("sender_daily_consolidated.csv", index=False)
+    sender_weekly.to_csv("sender_weekly_consolidated.csv", index=False)
+    sender_monthly.to_csv("sender_monthly_consolidated.csv", index=False)
+
+    receiver_daily.to_csv("receiver_daily_consolidated.csv", index=False)
+    receiver_weekly.to_csv("receiver_weekly_consolidated.csv", index=False)
+    receiver_monthly.to_csv("receiver_monthly_consolidated.csv", index=False)
+
+    print("✅ Consolidated transaction tables saved successfully.")
+except Exception as e:
+    print(f"❌ An error occurred during processing: {str(e)}")

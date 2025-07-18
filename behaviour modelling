@@ -1,0 +1,341 @@
+import pandas as pd
+import numpy as np
+from sklearn.mixture import GaussianMixture
+from sklearn.preprocessing import StandardScaler
+from sklearn.metrics import silhouette_score
+import matplotlib.pyplot as plt
+import seaborn as sns
+from scipy.stats import norm
+
+class BehavioralModelingSystem:
+    def __init__(self, transaction_data):
+        """
+        Initialize the behavioral modeling system with transaction data.
+        
+        Args:
+            transaction_data (pd.DataFrame): DataFrame containing transaction data with columns:
+                - Time, Date, Sender_account, Receiver_account, Amount, 
+                - Payment_currency, Received_currency, Sender_bank_location, 
+                - Receiver_bank_location, Payment_type, Is_laundering, Laundering_type
+        """
+        self.transactions = transaction_data
+        self.customer_profiles = {}
+        self.models = {}  # Will store GMM models for each customer
+        self.scalers = {}  # Will store scalers for each customer
+        
+    def create_behavioral_features(self, customer_id):
+        """
+        Create behavioral features for a specific customer based on their transaction history.
+        Returns a DataFrame with temporal and amount-based features.
+        """
+        # Filter transactions for this customer (both sent and received)
+        customer_tx = self.transactions[
+            (self.transactions['Sender_account'] == customer_id) | 
+            (self.transactions['Receiver_account'] == customer_id)
+        ].copy()
+        
+        if customer_tx.empty:
+            return None
+            
+        # Convert date/time to datetime and sort
+        customer_tx['datetime'] = pd.to_datetime(customer_tx['Date'] + ' ' + customer_tx['Time'])
+        customer_tx = customer_tx.sort_values('datetime')
+        
+        # Calculate time between transactions (in hours)
+        customer_tx['time_since_last_tx'] = customer_tx['datetime'].diff().dt.total_seconds() / 3600
+        customer_tx['time_since_last_tx'].fillna(0, inplace=True)
+        
+        # Create behavioral features
+        features = pd.DataFrame(index=[customer_id])
+        
+        # Transaction amount statistics
+        sent_tx = customer_tx[customer_tx['Sender_account'] == customer_id]
+        received_tx = customer_tx[customer_tx['Receiver_account'] == customer_id]
+        
+        # Amount features
+        features['avg_sent_amount'] = sent_tx['Amount'].mean()
+        features['std_sent_amount'] = sent_tx['Amount'].std()
+        features['max_sent_amount'] = sent_tx['Amount'].max()
+        features['avg_received_amount'] = received_tx['Amount'].mean()
+        features['std_received_amount'] = received_tx['Amount'].std()
+        features['max_received_amount'] = received_tx['Amount'].max()
+        
+        # Temporal features
+        features['avg_tx_frequency'] = customer_tx['time_since_last_tx'].mean()
+        features['std_tx_frequency'] = customer_tx['time_since_last_tx'].std()
+        features['tx_count'] = len(customer_tx)
+        
+        # Transaction type diversity
+        features['unique_currencies_sent'] = sent_tx['Payment_currency'].nunique()
+        features['unique_currencies_received'] = received_tx['Received_currency'].nunique()
+        features['unique_counterparties'] = pd.concat([
+            sent_tx['Receiver_account'], 
+            received_tx['Sender_account']
+        ]).nunique()
+        
+        # Fill NA values (for customers with only sent or only received transactions)
+        features.fillna(0, inplace=True)
+        
+        return features
+    
+    def create_all_profiles(self, customer_ids):
+        """
+        Create behavioral profiles for all specified customers.
+        """
+        profiles = []
+        for customer_id in customer_ids:
+            profile = self.create_behavioral_features(customer_id)
+            if profile is not None:
+                profiles.append(profile)
+                
+        if not profiles:
+            return None
+            
+        return pd.concat(profiles)
+    
+    def determine_optimal_clusters(self, data, max_clusters=10):
+        """
+        Determine the optimal number of clusters using silhouette score.
+        """
+        scaler = StandardScaler()
+        scaled_data = scaler.fit_transform(data)
+        
+        best_score = -1
+        best_n = 2
+        
+        for n in range(2, max_clusters+1):
+            gmm = GaussianMixture(n_components=n, random_state=42)
+            clusters = gmm.fit_predict(scaled_data)
+            score = silhouette_score(scaled_data, clusters)
+            
+            if score > best_score:
+                best_score = score
+                best_n = n
+                
+        return best_n
+    
+    def train_behavioral_models(self, customer_ids, use_optimal_clusters=True, n_clusters=3):
+        """
+        Train GMM models for behavioral clustering of customers.
+        
+        Args:
+            customer_ids: List of customer IDs to model
+            use_optimal_clusters: Whether to automatically determine optimal cluster count
+            n_clusters: Fixed number of clusters to use if not using optimal
+        """
+        # Create behavioral profiles for all customers
+        profiles = self.create_all_profiles(customer_ids)
+        if profiles is None:
+            print("No transaction data available for modeling.")
+            return
+            
+        # Store the complete profiles
+        self.customer_profiles = profiles
+        
+        # Scale the data
+        scaler = StandardScaler()
+        scaled_profiles = scaler.fit_transform(profiles)
+        self.scaler = scaler  # Store the scaler for new data
+        
+        # Determine optimal number of clusters if requested
+        if use_optimal_clusters:
+            n_clusters = self.determine_optimal_clusters(profiles)
+            print(f"Using optimal number of clusters: {n_clusters}")
+        
+        # Train GMM model
+        gmm = GaussianMixture(n_components=n_clusters, random_state=42)
+        gmm.fit(scaled_profiles)
+        
+        # Assign clusters to profiles
+        profiles['behavior_cluster'] = gmm.predict(scaled_profiles)
+        profiles['cluster_probability'] = np.max(gmm.predict_proba(scaled_profiles), axis=1)
+        
+        # Calculate anomaly scores (negative log likelihood)
+        profiles['anomaly_score'] = -gmm.score_samples(scaled_profiles)
+        
+        # Store the model
+        self.model = gmm
+        
+        return profiles
+    
+    def evaluate_new_transactions(self, new_transactions, threshold=0.95):
+        """
+        Evaluate new transactions against the learned behavioral models.
+        Returns DataFrame with anomaly scores and flags.
+        
+        Args:
+            new_transactions: DataFrame with new transactions
+            threshold: Probability threshold for flagging anomalies
+        """
+        results = []
+        
+        # Get unique customers in new transactions
+        customers = pd.concat([
+            new_transactions['Sender_account'],
+            new_transactions['Receiver_account']
+        ]).unique()
+        
+        for customer_id in customers:
+            if customer_id not in self.customer_profiles.index:
+                continue  # Skip new customers we don't have models for
+                
+            # Create behavioral features for new transactions
+            current_profile = self.create_behavioral_features(customer_id)
+            if current_profile is None:
+                continue
+                
+            # Scale using the same scaler
+            scaled_profile = self.scaler.transform(current_profile)
+            
+            # Calculate anomaly score
+            anomaly_score = -self.model.score_samples(scaled_profile)[0]
+            
+            # Get cluster probabilities
+            probs = self.model.predict_proba(scaled_profile)[0]
+            max_prob = np.max(probs)
+            
+            # Flag if probability is below threshold or anomaly score is high
+            is_anomaly = (max_prob < threshold) or (anomaly_score > np.percentile(
+                self.customer_profiles['anomaly_score'], 95
+            ))
+            
+            results.append({
+                'customer_id': customer_id,
+                'behavior_cluster': self.model.predict(scaled_profile)[0],
+                'cluster_probability': max_prob,
+                'anomaly_score': anomaly_score,
+                'is_anomaly': is_anomaly,
+                'cluster_probs': probs
+            })
+            
+        return pd.DataFrame(results)
+    
+    def visualize_clusters(self, features_to_plot=None):
+        """
+        Visualize the behavioral clusters using the first 2 principal components.
+        """
+        if not hasattr(self, 'customer_profiles'):
+            print("No models have been trained yet.")
+            return
+            
+        from sklearn.decomposition import PCA
+        
+        # Reduce dimensionality for visualization
+        pca = PCA(n_components=2)
+        scaled_data = self.scaler.transform(self.customer_profiles.drop(
+            ['behavior_cluster', 'cluster_probability', 'anomaly_score'], axis=1, errors='ignore'
+        ))
+        principal_components = pca.fit_transform(scaled_data)
+        
+        # Create plot
+        plt.figure(figsize=(10, 8))
+        scatter = plt.scatter(
+            principal_components[:, 0], 
+            principal_components[:, 1],
+            c=self.customer_profiles['behavior_cluster'],
+            cmap='viridis',
+            alpha=0.6
+        )
+        
+        plt.title('Behavioral Clusters (PCA Visualization)')
+        plt.xlabel('Principal Component 1')
+        plt.ylabel('Principal Component 2')
+        plt.colorbar(scatter, label='Cluster')
+        plt.show()
+        
+        # Print cluster statistics
+        print("\nCluster Statistics:")
+        print(self.customer_profiles.groupby('behavior_cluster').agg({
+            'avg_sent_amount': ['mean', 'std'],
+            'tx_count': ['mean', 'std'],
+            'anomaly_score': ['mean', 'std']
+        }))
+    
+    def plot_feature_distributions(self):
+        """
+        Plot feature distributions by cluster.
+        """
+        if not hasattr(self, 'customer_profiles'):
+            print("No models have been trained yet.")
+            return
+            
+        features = self.customer_profiles.drop(
+            ['behavior_cluster', 'cluster_probability', 'anomaly_score'], axis=1, errors='ignore'
+        )
+        
+        n_cols = 3
+        n_rows = int(np.ceil(len(features.columns) / n_cols))
+        
+        plt.figure(figsize=(15, 5*n_rows))
+        
+        for i, col in enumerate(features.columns):
+            plt.subplot(n_rows, n_cols, i+1)
+            for cluster in sorted(self.customer_profiles['behavior_cluster'].unique()):
+                sns.kdeplot(
+                    features[self.customer_profiles['behavior_cluster'] == cluster][col],
+                    label=f'Cluster {cluster}',
+                    fill=True
+                )
+            plt.title(f'Distribution of {col} by Cluster')
+            plt.legend()
+            
+        plt.tight_layout()
+        plt.show()
+
+# Example usage
+if __name__ == "__main__":
+    # Generate synthetic transaction data
+    np.random.seed(42)
+    n_customers = 100
+    n_transactions = 5000
+    
+    # Create customer IDs
+    customer_ids = [f"CUST_{i:03d}" for i in range(n_customers)]
+    
+    # Generate transactions with different behavioral patterns
+    data = {
+        'Date': np.random.choice(pd.date_range('2023-01-01', '2023-06-30'), n_transactions).strftime('%Y-%m-%d'),
+        'Time': np.random.choice([f"{h:02d}:{m:02d}:{s:02d}" 
+                                for h in range(24) 
+                                for m in range(0, 60, 15) 
+                                for s in range(0, 60, 15)]), n_transactions),
+        'Sender_account': np.random.choice(customer_ids, n_transactions),
+        'Receiver_account': np.random.choice(customer_ids, n_transactions),
+        'Amount': np.concatenate([
+            np.random.normal(100, 20, int(n_transactions*0.6)),  # Normal transactions
+            np.random.exponential(500, int(n_transactions*0.3)), # Larger transactions
+            np.random.uniform(5000, 10000, int(n_transactions*0.1)) # Potential laundering
+        ]),
+        'Payment_currency': np.random.choice(['USD', 'EUR', 'GBP', 'JPY'], n_transactions),
+        'Is_laundering': np.random.choice([0, 1], n_transactions, p=[0.95, 0.05])
+    }
+    transaction_data = pd.DataFrame(data)
+    
+    # Initialize behavioral modeling system
+    bms = BehavioralModelingSystem(transaction_data)
+    
+    # Train models on all customers
+    print("Training behavioral models...")
+    profiles = bms.train_behavioral_models(customer_ids)
+    
+    # Visualize results
+    print("\nVisualizing clusters...")
+    bms.visualize_clusters()
+    bms.plot_feature_distributions()
+    
+    # Generate some new transactions for evaluation
+    new_data = {
+        'Date': ['2023-07-01', '2023-07-01', '2023-07-02', '2023-07-02'],
+        'Time': ['10:15:00', '14:30:00', '09:45:00', '16:20:00'],
+        'Sender_account': ['CUST_001', 'CUST_050', 'CUST_001', 'CUST_075'],
+        'Receiver_account': ['CUST_002', 'CUST_051', 'CUST_003', 'CUST_076'],
+        'Amount': [120, 5500, 130, 8000],  # Two normal, two potentially anomalous
+        'Payment_currency': ['USD', 'EUR', 'USD', 'GBP']
+    }
+    new_transactions = pd.DataFrame(new_data)
+    
+    # Evaluate new transactions
+    print("\nEvaluating new transactions...")
+    results = bms.evaluate_new_transactions(new_transactions)
+    print("\nAnomaly Detection Results:")
+    print(results[['customer_id', 'behavior_cluster', 'cluster_probability', 'anomaly_score', 'is_anomaly']])

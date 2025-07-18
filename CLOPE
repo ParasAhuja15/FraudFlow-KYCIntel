@@ -1,0 +1,282 @@
+import pandas as pd
+import numpy as np
+from collections import defaultdict
+import math
+from itertools import combinations
+import networkx as nx
+import matplotlib.pyplot as plt
+
+# Load your transaction data
+# df = pd.read_csv('aml_transactions.csv')
+
+df = pd.DataFrame(data)
+
+# Convert date to datetime
+df['Datetime'] = pd.to_datetime(df['Date'] + ' ' + df['Time'])
+
+class CLOPE:
+    def __init__(self, is_repulsion=True, r=2.5, max_iter=10):
+        self.is_repulsion = is_repulsion
+        self.r = r  # Repulsion parameter
+        self.max_iter = max_iter
+        self.clusters = {}
+        self.transaction_map = {}
+        
+    def _initialize_clusters(self, transactions):
+        """Initialize each transaction in its own cluster"""
+        self.clusters = {i: {'transactions': [t], 'items': set(t[1])} 
+                        for i, t in enumerate(transactions)}
+        self.transaction_map = {t[0]: i for i, t in enumerate(transactions)}
+        
+    def _calculate_profit(self, cluster):
+        """Calculate profit of a cluster (height/width ratio)"""
+        if not cluster['transactions']:
+            return 0
+            
+        S = len(cluster['transactions'])  # Cluster size
+        W = len(cluster['items'])         # Cluster width
+        D = sum(len(t[1]) for t in cluster['transactions'])  # Total items
+        
+        if W == 0:
+            return 0
+            
+        return (S * D) / (W ** self.r)
+    
+    def _delta_add(self, transaction, cluster_id):
+        """Calculate delta profit if adding transaction to cluster"""
+        old_profit = self._calculate_profit(self.clusters[cluster_id])
+        
+        # Create temp cluster with transaction added
+        temp_cluster = {
+            'transactions': self.clusters[cluster_id]['transactions'] + [transaction],
+            'items': self.clusters[cluster_id]['items'].union(set(transaction[1]))
+        }
+        
+        new_profit = self._calculate_profit(temp_cluster)
+        return new_profit - old_profit
+    
+    def _delta_remove(self, transaction, cluster_id):
+        """Calculate delta profit if removing transaction from cluster"""
+        old_profit = self._calculate_profit(self.clusters[cluster_id])
+        
+        # Create temp cluster with transaction removed
+        remaining_trans = [t for t in self.clusters[cluster_id]['transactions'] 
+                         if t[0] != transaction[0]]
+        remaining_items = set()
+        for t in remaining_trans:
+            remaining_items.update(t[1])
+            
+        temp_cluster = {
+            'transactions': remaining_trans,
+            'items': remaining_items
+        }
+        
+        new_profit = self._calculate_profit(temp_cluster)
+        return old_profit - new_profit
+    
+    def fit(self, transactions):
+        """Cluster transactions using CLOPE algorithm"""
+        # Convert transactions to (id, items) format
+        transactions = [(i, set(items)) for i, items in enumerate(transactions)]
+        
+        # Initialize clusters
+        self._initialize_clusters(transactions)
+        
+        iteration = 0
+        changed = True
+        
+        while changed and iteration < self.max_iter:
+            changed = False
+            iteration += 1
+            
+            for t in transactions:
+                current_cluster = self.transaction_map[t[0]]
+                
+                # Calculate delta for removing from current cluster
+                delta_remove = self._delta_remove(t, current_cluster)
+                
+                # Find best cluster to move to
+                best_cluster = current_cluster
+                max_delta = -math.inf
+                
+                for c in self.clusters:
+                    if c == current_cluster:
+                        continue
+                        
+                    delta_add = self._delta_add(t, c)
+                    delta_total = delta_add - delta_remove if self.is_repulsion else delta_add
+                    
+                    if delta_total > max_delta:
+                        max_delta = delta_total
+                        best_cluster = c
+                
+                # Move transaction if beneficial
+                if max_delta > 0 and best_cluster != current_cluster:
+                    # Remove from current cluster
+                    self.clusters[current_cluster]['transactions'] = [
+                        t for t in self.clusters[current_cluster]['transactions']
+                        if t[0] != t[0]
+                    ]
+                    self.clusters[current_cluster]['items'] = set()
+                    for t in self.clusters[current_cluster]['transactions']:
+                        self.clusters[current_cluster]['items'].update(t[1])
+                    
+                    # Add to new cluster
+                    self.clusters[best_cluster]['transactions'].append(t)
+                    self.clusters[best_cluster]['items'].update(t[1])
+                    self.transaction_map[t[0]] = best_cluster
+                    changed = True
+        
+        return self.clusters
+
+def detect_laundering_patterns(df, clusters):
+    """Detect specific laundering patterns from CLOPE clusters"""
+    results = []
+    
+    for cluster_id, cluster in clusters.items():
+        # Skip small clusters
+        if len(cluster['transactions']) < 3:
+            continue
+            
+        # Get all transactions in this cluster
+        txn_ids = [t[0] for t in cluster['transactions']]
+        cluster_txns = df.iloc[txn_ids]
+        
+        # Pattern 1: Circular transactions
+        circular_score = detect_circular_patterns(cluster_txns)
+        
+        # Pattern 2: Smurfing (many small transactions)
+        smurfing_score = detect_smurfing_patterns(cluster_txns)
+        
+        # Pattern 3: Integration (gathering from many sources)
+        integration_score = detect_integration_patterns(cluster_txns)
+        
+        # Add to results if any pattern detected
+        if circular_score > 0.7 or smurfing_score > 0.7 or integration_score > 0.7:
+            results.append({
+                'cluster_id': cluster_id,
+                'size': len(cluster['transactions']),
+                'circular_score': circular_score,
+                'smurfing_score': smurfing_score,
+                'integration_score': integration_score,
+                'transactions': txn_ids
+            })
+    
+    return pd.DataFrame(results)
+
+def detect_circular_patterns(cluster_txns):
+    """Detect circular money flows (A->B->C->A)"""
+    G = nx.DiGraph()
+    
+    # Add edges with weights (amount)
+    for _, row in cluster_txns.iterrows():
+        G.add_edge(row['Sender_account'], row['Receiver_account'], weight=row['Amount'])
+    
+    # Check for cycles
+    try:
+        cycles = list(nx.simple_cycles(G))
+        if cycles:
+            # Calculate score based on cycle length and amount
+            max_cycle_len = max(len(cycle) for cycle in cycles)
+            total_cycle_amount = sum(
+                G[cycle[i]][cycle[(i+1)%len(cycle)]]['weight']
+                for cycle in cycles
+                for i in range(len(cycle))
+            )
+            return min(1.0, max_cycle_len/10 + total_cycle_amount/100000)
+    except:
+        pass
+    
+    return 0.0
+
+def detect_smurfing_patterns(cluster_txns):
+    """Detect smurfing (many small transactions from few senders)"""
+    if len(cluster_txns) < 5:  # Need multiple transactions for smurfing
+        return 0.0
+    
+    # Group by sender-receiver pairs
+    sender_stats = cluster_txns.groupby('Sender_account').agg({
+        'Amount': ['count', 'mean', 'sum'],
+        'Receiver_account': 'nunique'
+    })
+    
+    # Criteria for smurfing
+    avg_amount = cluster_txns['Amount'].mean()
+    if (sender_stats[('Amount', 'count')] > 3).any() and avg_amount < 10000:
+        return min(1.0, (5 / avg_amount) * 0.2 if avg_amount > 0 else 1.0)
+    
+    return 0.0
+
+def detect_integration_patterns(cluster_txns):
+    """Detect integration (money gathered from many sources)"""
+    if len(cluster_txns) < 5:
+        return 0.0
+    
+    # Group by receiver
+    receiver_stats = cluster_txns.groupby('Receiver_account').agg({
+        'Amount': ['count', 'mean', 'sum'],
+        'Sender_account': 'nunique'
+    })
+    
+    # Criteria for integration
+    if (receiver_stats[('Sender_account', 'nunique')] > 3).any():
+        unique_senders = receiver_stats[('Sender_account', 'nunique')].max()
+        return min(1.0, unique_senders / 10)
+    
+    return 0.0
+
+# Prepare transaction data for CLOPE
+# Each transaction is represented by its categorical attributes
+transactions = []
+for _, row in df.iterrows():
+    items = [
+        f"SENDER_{row['Sender_account']}",
+        f"RECEIVER_{row['Receiver_account']}",
+        f"AMOUNT_{row['Amount']//1000}k",  # Binned amount
+        f"CURRENCY_{row['Payment_currency']}",
+        f"TYPE_{row['Payment_type']}",
+        f"TIME_{row['Time'].split(':')[0]}h"  # Binned by hour
+    ]
+    transactions.append(items)
+
+# Run CLOPE algorithm
+clope = CLOPE(r=2.5, max_iter=10)
+clusters = clope.fit(transactions)
+
+# Detect laundering patterns
+laundering_clusters = detect_laundering_patterns(df, clusters)
+
+# Save results
+laundering_clusters.to_csv('clope_laundering_clusters.csv', index=False)
+print(f"Detected {len(laundering_clusters)} suspicious clusters")
+
+# Visualize top clusters
+for _, row in laundering_clusters.head(3).iterrows():
+    cluster_txns = df.iloc[row['transactions']]
+    
+    print(f"\nCluster {row['cluster_id']} - Size: {row['size']}")
+    print(f"Circular: {row['circular_score']:.2f}, Smurfing: {row['smurfing_score']:.2f}, Integration: {row['integration_score']:.2f}")
+    
+    # Plot transaction network
+    G = nx.DiGraph()
+    for _, txn in cluster_txns.iterrows():
+        G.add_edge(txn['Sender_account'], txn['Receiver_account'], weight=txn['Amount'])
+    
+    plt.figure(figsize=(10, 8))
+    pos = nx.spring_layout(G)
+    nx.draw_networkx_nodes(G, pos, node_size=500)
+    nx.draw_networkx_edges(G, pos, edge_color='gray', width=1, 
+                          arrows=True, arrowsize=20)
+    nx.draw_networkx_labels(G, pos, font_size=10)
+    
+    edge_labels = {(u, v): f"${d['weight']:,.0f}" 
+                  for u, v, d in G.edges(data=True)}
+    nx.draw_networkx_edge_labels(G, pos, edge_labels=edge_labels, font_size=8)
+    
+    plt.title(f"Cluster {row['cluster_id']} - {'/'.join([
+        f'Circular: {row['circular_score']:.2f}',
+        f'Smurfing: {row['smurfing_score']:.2f}',
+        f'Integration: {row['integration_score']:.2f}'
+    ])}")
+    plt.axis('off')
+    plt.show()

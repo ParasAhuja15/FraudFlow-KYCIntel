@@ -1,0 +1,61 @@
+import pandas as pd
+import numpy as np
+
+
+# Combine Time + Date → Datetime
+df['Datetime'] = pd.to_datetime(df['Date'] + ' ' + df['Time'])
+
+# Set index for time-based resampling
+df.set_index('Datetime', inplace=True)
+
+# Drop original columns for clarity
+# df.drop(['Time', 'Date'], axis=1, inplace=False)
+# df.drop(['Time', 'Date'], axis=1, inplace=True)
+
+# Function to create individual profile for a given account
+def create_individual_profile(df, role='Sender_account'):
+    profile_list = []
+    
+    # Group by individual (sender or receiver)
+    grouped = df.groupby(role)
+
+    for account, group in grouped:
+        # Sort by time for temporal patterns
+        group = group.sort_index()
+
+        # Daily, Weekly, Monthly aggregations
+        daily = group['Amount'].resample('D').sum()
+        weekly = group['Amount'].resample('W').sum()
+        monthly = group['Amount'].resample('ME').sum()
+
+        profile = {
+            'account_id': account,
+            'total_txns': len(group),
+            'total_amount': group['Amount'].sum(),
+            'mean_txn_amount': group['Amount'].mean(),
+            'std_dev_amount': group['Amount'].std(),
+            'most_common_payment_type': group['Payment_type'].mode()[0] if not group['Payment_type'].mode().empty else None,
+            'most_common_currency': group['Payment_currency'].mode()[0] if not group['Payment_currency'].mode().empty else None,
+            'location_distribution': group[role.replace('account', 'bank_location')].value_counts().to_dict(),
+            'daily_amounts': daily.to_dict(),
+            'weekly_amounts': weekly.to_dict(),
+            'monthly_amounts': monthly.to_dict(),
+        }
+
+        profile_list.append(profile)
+
+    return profile_list
+
+# Create sender and receiver profiles
+sender_profiles = create_individual_profile(df, role='Sender_account')
+receiver_profiles = create_individual_profile(df, role='Receiver_account')
+
+# Convert to DataFrames
+sender_df = pd.DataFrame(sender_profiles)
+receiver_df = pd.DataFrame(receiver_profiles)
+
+# Save profiles for downstream use
+sender_df.to_json("sender_profiles.json", orient="records", indent=2)
+receiver_df.to_json("receiver_profiles.json", orient="records", indent=2)
+
+print("Profiles generated and saved.")
